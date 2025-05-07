@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11-alpine
 
 WORKDIR /app
 
@@ -13,7 +13,7 @@ COPY app/ .
 RUN mkdir -p /app/credentials
 
 # Expose the port
-EXPOSE 8050
+EXPOSE 7860
 
 # Command to run the application
 # Use the default Hugging Face port 7860
