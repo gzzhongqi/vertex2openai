@@ -37,6 +37,12 @@ router = APIRouter()
 @router.post("/v1/chat/completions")
 async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api_key: str = Depends(get_api_key)):
     try:
+        # 添加对模型名称的检查，拦截不是gemini-2.5-pro-exp-03-25开头的模型
+        if not request.model.startswith("gemini-2.5-pro-exp-03-25"):
+            error_msg = f"当前仅支持模型 'gemini-2.5-pro-exp-03-25'，您请求的模型 '{request.model}' 不被支持"
+            print(f"ERROR: {error_msg}")
+            return JSONResponse(status_code=400, content=create_openai_error_response(400, error_msg, "invalid_request_error"))
+             
         credential_manager_instance = fastapi_request.app.state.credential_manager
         OPENAI_DIRECT_SUFFIX = "-openai"
         EXPERIMENTAL_MARKER = "-exp-"
