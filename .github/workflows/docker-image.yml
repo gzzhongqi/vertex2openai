@@ -1,4 +1,5 @@
 name: Docker Image CI
+
 permissions: write-all
 on:
   push:
