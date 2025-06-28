@@ -2,27 +2,20 @@ import json
 import time
 import math
 import asyncio
-import base64
-import random 
 from typing import List, Dict, Any, Callable, Union, Optional
 
 from fastapi.responses import JSONResponse, StreamingResponse
 from google.auth.transport.requests import Request as AuthRequest
 from google.genai import types
-from google.genai.types import GenerateContentResponse 
-from google import genai
 from openai import AsyncOpenAI 
-from openai.types.chat import ChatCompletionMessage, ChatCompletionMessageToolCall
-from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall, ChoiceDeltaToolCallFunction
+
 
 from models import OpenAIRequest, OpenAIMessage
 from message_processing import (
-    deobfuscate_text,
-    convert_to_openai_format, 
+    convert_to_openai_format,
     convert_chunk_to_openai,
-    create_final_chunk,
-    parse_gemini_response_for_reasoning_and_content, 
-    extract_reasoning_by_tags
+    extract_reasoning_by_tags,
+    _create_safety_ratings_html
 )
 import config as app_config
 from config import VERTEX_REASONING_TAG
@@ -123,12 +116,13 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
     if request.seed is not None: config["seed"] = request.seed
     if request.n is not None: config["candidate_count"] = request.n
     
+    safety_threshold = "BLOCK_NONE" if app_config.SAFETY_SCORE else "BLOCK_ONLY_HIGH"
     config["safety_settings"] = [
-            types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="OFF"),
-            types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="OFF"),
-            types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="OFF"),
-            types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="OFF"),
-            types.SafetySetting(category="HARM_CATEGORY_CIVIC_INTEGRITY", threshold="OFF")
+            types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold=safety_threshold),
+            types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold=safety_threshold),
+            types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold=safety_threshold),
+            types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold=safety_threshold),
+            types.SafetySetting(category="HARM_CATEGORY_CIVIC_INTEGRITY", threshold=safety_threshold)
     ]
     # config["thinking_config"] = {"include_thoughts": True}
 
@@ -355,18 +349,29 @@ async def openai_fake_stream_generator(
         raw_response_obj = await api_call_task 
         openai_response_dict = raw_response_obj.model_dump(exclude_unset=True, exclude_none=True)
 
+        if app_config.SAFETY_SCORE and hasattr(raw_response_obj, "choices") and raw_response_obj.choices:
+            for i, choice_obj in enumerate(raw_response_obj.choices):
+                if hasattr(choice_obj, "safety_ratings") and choice_obj.safety_ratings:
+                    safety_html = _create_safety_ratings_html(choice_obj.safety_ratings)
+                    if i < len(openai_response_dict.get("choices", [])):
+                        choice_dict = openai_response_dict["choices"][i]
+                        message_dict = choice_dict.get("message")
+                        if message_dict:
+                            current_content = message_dict.get("content") or ""
+                            message_dict["content"] = current_content + safety_html
+
         if openai_response_dict.get("choices") and \
            isinstance(openai_response_dict["choices"], list) and \
            len(openai_response_dict["choices"]) > 0:
             
-            first_choice_dict_item = openai_response_dict["choices"] 
-            if first_choice_dict_item and isinstance(first_choice_dict_item, dict) : 
-                choice_message_ref = first_choice_dict_item.get("message", {}) 
+            first_choice_dict_item = openai_response_dict["choices"]
+            if first_choice_dict_item and isinstance(first_choice_dict_item, dict) :
+                choice_message_ref = first_choice_dict_item.get("message", {})
                 original_content = choice_message_ref.get("content")
                 if isinstance(original_content, str):
                     reasoning_text, actual_content = extract_reasoning_by_tags(original_content, VERTEX_REASONING_TAG)
                     choice_message_ref["content"] = actual_content
-                    if reasoning_text: 
+                    if reasoning_text:
                         choice_message_ref["reasoning_content"] = reasoning_text
         
         async for chunk_sse in _chunk_openai_response_dict_for_sse(

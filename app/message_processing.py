@@ -4,7 +4,8 @@ import json
 import time
 import random # For more unique tool_call_id
 import urllib.parse
-from typing import List, Dict, Any, Union, Literal, Tuple
+from typing import List, Dict, Any, Tuple
+import config as app_config
 
 from google.genai import types
 from models import OpenAIMessage, ContentPartText, ContentPartImage
@@ -292,6 +293,56 @@ def create_encrypted_full_gemini_prompt(messages: List[OpenAIMessage]) -> List[t
     return create_encrypted_gemini_prompt(processed_messages)
 
 
+def _create_safety_ratings_html(safety_ratings: list) -> str:
+    """Generates a styled HTML block for safety ratings."""
+    if not safety_ratings:
+        return ""
+
+    # Find the rating with the highest probability score
+    highest_rating = max(safety_ratings, key=lambda r: r.probability_score)
+    highest_score = highest_rating.probability_score
+
+    # Determine color based on the highest score
+    if highest_score <= 0.33:
+        color = "#0f8"  # green
+    elif highest_score <= 0.66:
+        color = "yellow"
+    else:
+        color = "#bf555d"
+
+    # Format the summary line for the highest score
+    summary_category = highest_rating.category.name.replace('HARM_CATEGORY_', '').replace('_', ' ').title()
+    summary_probability = highest_rating.probability.name
+    # Using .7f for score and .8f for severity as per example's precision
+    summary_score_str = f"{highest_rating.probability_score:.7f}" if highest_rating.probability_score is not None else "None"
+    summary_severity_str = f"{highest_rating.severity_score:.8f}" if highest_rating.severity_score is not None else "None"
+    summary_line = f"{summary_category}: {summary_probability} (Score: {summary_score_str}, Severity: {summary_severity_str})"
+
+    # Format the list of all ratings for the <pre> block
+    ratings_list = []
+    for rating in safety_ratings:
+        category = rating.category.name.replace('HARM_CATEGORY_', '').replace('_', ' ').title()
+        probability = rating.probability.name
+        score_str = f"{rating.probability_score:.7f}" if rating.probability_score is not None else "None"
+        severity_str = f"{rating.severity_score:.8f}" if rating.severity_score is not None else "None"
+        ratings_list.append(f"{category}: {probability} (Score: {score_str}, Severity: {severity_str})")
+    all_ratings_str = '\n'.join(ratings_list)
+
+    # CSS Style as specified
+    css_style = "<style>.cb{border:1px solid #444;margin:10px;border-radius:4px;background:#111}.cb summary{padding:8px;cursor:pointer;background:#222}.cb pre{margin:0;padding:10px;border-top:1px solid #444;white-space:pre-wrap}</style>"
+
+    # Final HTML structure
+    html_output = (
+        f'{css_style}'
+        f'<details class="cb">'
+        f'<summary style="color:{color}">{summary_line} ▼</summary>'
+        f'<pre>\\n--- Safety Ratings ---\\n{all_ratings_str}\\n</pre>'
+        f'</details>'
+    )
+
+    return html_output
+
+
 def deobfuscate_text(text: str) -> str:
     if not text: return text
     placeholder = "___TRIPLE_BACKTICK_PLACEHOLDER___"
@@ -385,6 +436,13 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
                     reasoning_str = deobfuscate_text(reasoning_str)
                     normal_content_str = deobfuscate_text(normal_content_str)
                 
+                if app_config.SAFETY_SCORE and hasattr(candidate, 'safety_ratings') and candidate.safety_ratings:
+                    safety_html = _create_safety_ratings_html(candidate.safety_ratings)
+                    if reasoning_str:
+                        reasoning_str += safety_html
+                    else:
+                        normal_content_str += safety_html
+                
                 message_payload["content"] = normal_content_str
                 if reasoning_str:
                     message_payload['reasoning_content'] = reasoning_str
@@ -437,7 +495,6 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
 
     if hasattr(chunk, 'candidates') and chunk.candidates:
         candidate = chunk.candidates[0] # Process first candidate for streaming
-        print(candidate)
         raw_gemini_finish_reason = getattr(candidate, 'finish_reason', None)
         if raw_gemini_finish_reason:
             if hasattr(raw_gemini_finish_reason, 'name'): raw_gemini_finish_reason_str = raw_gemini_finish_reason.name.upper()
@@ -481,6 +538,13 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
             if is_encrypt_full:
                 reasoning_text = deobfuscate_text(reasoning_text)
                 normal_text = deobfuscate_text(normal_text)
+
+            if app_config.SAFETY_SCORE and hasattr(candidate, 'safety_ratings') and candidate.safety_ratings:
+                safety_html = _create_safety_ratings_html(candidate.safety_ratings)
+                if reasoning_text:
+                    reasoning_text += safety_html
+                else:
+                    normal_text += safety_html
 
             if reasoning_text: delta_payload['reasoning_content'] = reasoning_text
             if normal_text: # Only add content if it's non-empty

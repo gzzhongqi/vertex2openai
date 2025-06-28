@@ -1,6 +1,5 @@
 import asyncio
 import json
-import random
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -11,7 +10,6 @@ from google import genai
 # Local module imports
 from models import OpenAIRequest
 from auth import get_api_key
-import config as app_config
 from message_processing import (
     create_gemini_prompt,
     create_encrypted_gemini_prompt,

@@ -4,13 +4,11 @@ This module encapsulates all OpenAI-specific logic that was previously in chat_a
 """
 import json
 import time
-import asyncio
 import httpx
-from typing import Dict, Any, AsyncGenerator, Optional
+from typing import Dict, Any, AsyncGenerator
 
 from fastapi.responses import JSONResponse, StreamingResponse
 import openai
-from google.auth.transport.requests import Request as AuthRequest
 
 from models import OpenAIRequest
 from config import VERTEX_REASONING_TAG
@@ -82,7 +80,19 @@ class ExpressClientWrapper:
         if 'extra_body' in payload:
             payload.update(payload.pop('extra_body'))
 
-        async with httpx.AsyncClient(timeout=300) as client:
+        proxies = None
+        if app_config.PROXY_URL:
+            if app_config.PROXY_URL.startswith("socks"):
+                proxies = {"all://": app_config.PROXY_URL}
+            else:
+                proxies = {"https://": app_config.PROXY_URL}
+
+        client_args = {'timeout': 300}
+        if proxies:
+            client_args['proxies'] = proxies
+        if app_config.SSL_CERT_FILE:
+            client_args['verify'] = app_config.SSL_CERT_FILE
+        async with httpx.AsyncClient(**client_args) as client:
             async with client.stream("POST", endpoint, headers=headers, params=params, json=payload, timeout=None) as response:
                 response.raise_for_status()
                 async for chunk in self._stream_generator(response):
@@ -108,7 +118,19 @@ class ExpressClientWrapper:
         if 'extra_body' in payload:
             payload.update(payload.pop('extra_body'))
 
-        async with httpx.AsyncClient(timeout=300) as client:
+        proxies = None
+        if app_config.PROXY_URL:
+            if app_config.PROXY_URL.startswith("socks"):
+                proxies = {"all://": app_config.PROXY_URL}
+            else:
+                proxies = {"https://": app_config.PROXY_URL}
+
+        client_args = {'timeout': 300}
+        if proxies:
+            client_args['proxies'] = proxies
+        if app_config.SSL_CERT_FILE:
+            client_args['verify'] = app_config.SSL_CERT_FILE
+        async with httpx.AsyncClient(**client_args) as client:
             response = await client.post(endpoint, headers=headers, params=params, json=payload, timeout=None)
             response.raise_for_status()
             return FakeChatCompletion(response.json())
@@ -120,12 +142,13 @@ class OpenAIDirectHandler:
     def __init__(self, credential_manager=None, express_key_manager=None):
         self.credential_manager = credential_manager
         self.express_key_manager = express_key_manager
+        safety_threshold = "BLOCK_NONE" if app_config.SAFETY_SCORE else "OFF"
         self.safety_settings = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
-            {"category": 'HARM_CATEGORY_CIVIC_INTEGRITY', "threshold": 'OFF'}
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": safety_threshold},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": safety_threshold},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": safety_threshold},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": safety_threshold},
+            {"category": 'HARM_CATEGORY_CIVIC_INTEGRITY', "threshold": safety_threshold}
         ]
 
     def create_openai_client(self, project_id: str, gcp_token: str, location: str = "global") -> openai.AsyncOpenAI:
@@ -135,9 +158,24 @@ class OpenAIDirectHandler:
             f"projects/{project_id}/locations/{location}/endpoints/openapi"
         )
         
+        proxies = None
+        if app_config.PROXY_URL:
+            if app_config.PROXY_URL.startswith("socks"):
+                proxies = {"all://": app_config.PROXY_URL}
+            else:
+                proxies = {"https://": app_config.PROXY_URL}
+
+        client_args = {}
+        if proxies:
+            client_args['proxies'] = proxies
+        if app_config.SSL_CERT_FILE:
+            client_args['verify'] = app_config.SSL_CERT_FILE
+        
+        http_client = httpx.AsyncClient(**client_args) if client_args else None
         return openai.AsyncOpenAI(
             base_url=endpoint_url,
             api_key=gcp_token,  # OAuth token
+            http_client=http_client,
         )
     
     def prepare_openai_params(self, request: OpenAIRequest, model_id: str, is_openai_search: bool = False) -> Dict[str, Any]:

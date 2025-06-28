@@ -1,9 +1,5 @@
 from fastapi import FastAPI, Depends # Depends might be used by root endpoint
-# from fastapi.responses import JSONResponse # Not used
 from fastapi.middleware.cors import CORSMiddleware
-# import asyncio # Not used
-# import os # Not used
-
 
 # Local module imports
 from auth import get_api_key # Potentially for root endpoint
@@ -14,8 +10,6 @@ from vertex_ai_init import init_vertex_ai
 # Routers
 from routes import models_api
 from routes import chat_api
-
-# import config as app_config # Not directly used in main.py
 
 app = FastAPI(title="OpenAI to Gemini Adapter")
 

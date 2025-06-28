@@ -3,7 +3,6 @@ from fastapi import APIRouter, Depends, Request
 from typing import List, Dict, Any, Set
 from auth import get_api_key
 from model_loader import get_vertex_models, get_vertex_express_models, refresh_models_config_cache
-import config as app_config
 from credentials_manager import CredentialManager
 
 router = APIRouter()

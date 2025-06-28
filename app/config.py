@@ -36,4 +36,10 @@ VERTEX_REASONING_TAG = "vertex_think_tag"
 # Round-robin credential selection strategy
 ROUNDROBIN = os.environ.get("ROUNDROBIN", "false").lower() == "true"
 
+# Safety score display setting
+SAFETY_SCORE = os.environ.get("SAFETY_SCORE", "false").lower() == "true"
 # Validation logic moved to app/auth.py
+
+# Proxy settings
+PROXY_URL = os.environ.get("PROXY_URL")
+SSL_CERT_FILE = os.environ.get("SSL_CERT_FILE")

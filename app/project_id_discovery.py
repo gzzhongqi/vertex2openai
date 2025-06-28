@@ -2,9 +2,15 @@ import aiohttp
 import json
 import re
 from typing import Dict, Optional
+import config
 
 # Global cache for project IDs: {api_key: project_id}
 PROJECT_ID_CACHE: Dict[str, str] = {}
+
+
+def _get_proxy_url() -> Optional[str]:
+    """Get proxy URL from config."""
+    return config.PROXY_URL
 
 
 async def discover_project_id(api_key: str) -> str:
@@ -34,9 +40,10 @@ async def discover_project_id(api_key: str) -> str:
         "contents": [{"role": "user", "parts": [{"text": "test"}]}]
     }
     
+    proxy = _get_proxy_url()
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.post(error_url, json=payload) as response:
+            async with session.post(error_url, json=payload, proxy=proxy, ssl=getattr(config, "SSL_CERT_FILE", None)) as response:
                 response_text = await response.text()
                 
                 try:
