@@ -4,7 +4,7 @@ import os
 DEFAULT_PASSWORD = "123456"
 
 # Get password from environment variable or use default
-API_KEY = os.environ.get("API_KEY", DEFAULT_PASSWORD)
+API_KEY = os.environ.get("PASSWORD", os.environ.get("API_KEY", DEFAULT_PASSWORD))
 
 # HuggingFace Authentication Settings
 HUGGINGFACE = os.environ.get("HUGGINGFACE", "false").lower() == "true"
@@ -14,10 +14,10 @@ HUGGINGFACE_API_KEY = os.environ.get("HUGGINGFACE_API_KEY", "") # Default to emp
 CREDENTIALS_DIR = os.environ.get("CREDENTIALS_DIR", "/app/credentials")
 
 # JSON string for service account credentials (can be one or multiple comma-separated)
-GOOGLE_CREDENTIALS_JSON_STR = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+GOOGLE_CREDENTIALS_JSON_STR = os.environ.get("JSON", os.environ.get("GOOGLE_CREDENTIALS_JSON"))
 
 # API Key for Vertex Express Mode
-raw_vertex_keys = os.environ.get("VERTEX_EXPRESS_API_KEY")
+raw_vertex_keys = os.environ.get("EXPRESS", os.environ.get("VERTEX_EXPRESS_API_KEY"))
 if raw_vertex_keys:
     VERTEX_EXPRESS_API_KEY_VAL = [key.strip() for key in raw_vertex_keys.split(',') if key.strip()]
 else:
