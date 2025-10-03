@@ -108,83 +108,61 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
         if "gemini-2.5-flash-lite" in base_model_name:
             gen_config_dict["thinking_config"]["include_thoughts"] = False
 
-        client_to_use = None
+        # Create a factory function for Gemini clients that rotates keys/credentials on each call
+        # This enables race mode to use different keys for each concurrent request
         express_key_manager_instance = fastapi_request.app.state.express_key_manager
-
-        # This client initialization logic is for Gemini models (i.e., non-OpenAI Direct models).
-        # If 'is_openai_direct_model' is true, this section will be skipped, and the
-        # dedicated 'if is_openai_direct_model:' block later will handle it.
-        if is_express_model_request: # Changed from elif to if
-            if express_key_manager_instance.get_total_keys() == 0:
-                error_msg = f"Model '{request.model}' is an Express model and requires an Express API key, but none are configured."
-                print(f"ERROR: {error_msg}")
-                return JSONResponse(status_code=401, content=create_openai_error_response(401, error_msg, "authentication_error"))
-
-            print(f"INFO: Attempting Vertex Express Mode for model request: {request.model} (base: {base_model_name})")
-            
-            # Use the ExpressKeyManager to get keys and handle retries
-            total_keys = express_key_manager_instance.get_total_keys()
-            for attempt in range(total_keys):
-                key_tuple = express_key_manager_instance.get_express_api_key()
-                if key_tuple:
-                    original_idx, key_val = key_tuple
-                    try:
-                        # Check if model contains "gemini-2.5-pro" or "gemini-2.5-flash" for direct URL approach
-                        if "gemini-2.5-pro" in base_model_name or "gemini-2.5-flash" in base_model_name:
-                            project_id = await discover_project_id(key_val)
-                            base_url = f"https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global"
-                            client_to_use = genai.Client(
-                                vertexai=True,
-                                api_key=key_val,
-                                http_options=types.HttpOptions(base_url=base_url)
-                            )
-                            client_to_use._api_client._http_options.api_version = None
-                            print(f"INFO: Attempt {attempt+1}/{total_keys} - Using Vertex Express Mode with custom base URL for model {request.model} (base: {base_model_name}) with API key (original index: {original_idx}).")
-                        else:
-                            client_to_use = genai.Client(vertexai=True, api_key=key_val)
-                            print(f"INFO: Attempt {attempt+1}/{total_keys} - Using Vertex Express Mode SDK for model {request.model} (base: {base_model_name}) with API key (original index: {original_idx}).")
-                        break # Successfully initialized client
-                    except Exception as e:
-                        print(f"WARNING: Attempt {attempt+1}/{total_keys} - Vertex Express Mode client init failed for API key (original index: {original_idx}) for model {request.model}: {e}. Trying next key.")
-                        client_to_use = None # Ensure client_to_use is None for this attempt
-                else:
-                    # Should not happen if total_keys > 0, but adding a safeguard
-                    print(f"WARNING: Attempt {attempt+1}/{total_keys} - get_express_api_key() returned None unexpectedly.")
-                    client_to_use = None
-                    # Optional: break here if None indicates no more keys are expected
-
-            if client_to_use is None: # All configured Express keys failed or none were returned
-                error_msg = f"All {total_keys} configured Express API keys failed to initialize or were unavailable for model '{request.model}'."
-                print(f"ERROR: {error_msg}")
-                return JSONResponse(status_code=500, content=create_openai_error_response(500, error_msg, "server_error"))
         
-        else: # Not an Express model request, therefore an SA credential model request for Gemini
-            print(f"INFO: Model '{request.model}' is an SA credential request for Gemini. Attempting SA credentials.")
-            rotated_credentials, rotated_project_id = credential_manager_instance.get_credentials()
-            
-            if rotated_credentials and rotated_project_id:
-                try:
-                    client_to_use = genai.Client(vertexai=True, credentials=rotated_credentials, project=rotated_project_id, location="global")
-                    print(f"INFO: Using SA credential for Gemini model {request.model} (project: {rotated_project_id})")
-                except Exception as e:
-                    client_to_use = None # Ensure it's None on failure
-                    error_msg = f"SA credential client initialization failed for Gemini model '{request.model}': {e}."
-                    print(f"ERROR: {error_msg}")
-                    return JSONResponse(status_code=500, content=create_openai_error_response(500, error_msg, "server_error"))
-            else: # No SA credentials available for an SA model request
-                error_msg = f"Model '{request.model}' requires SA credentials for Gemini, but none are available or loaded."
-                print(f"ERROR: {error_msg}")
-                return JSONResponse(status_code=401, content=create_openai_error_response(401, error_msg, "authentication_error"))
+        async def gemini_client_factory():
+            """Factory function that creates a new Gemini client with rotated key/credential."""
+            if is_express_model_request:
+                key_tuple = express_key_manager_instance.get_express_api_key()  # Rotates keys
+                if not key_tuple:
+                    raise Exception("Express API key not available for Gemini client.")
+                
+                original_idx, key_val = key_tuple
+                
+                # Check if model contains "gemini-2.5-pro" or "gemini-2.5-flash" for direct URL approach
+                if "gemini-2.5-pro" in base_model_name or "gemini-2.5-flash" in base_model_name:
+                    project_id = await discover_project_id(key_val)
+                    base_url = f"https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global"
+                    client = genai.Client(
+                        vertexai=True,
+                        api_key=key_val,
+                        http_options=types.HttpOptions(base_url=base_url)
+                    )
+                    client._api_client._http_options.api_version = None
+                    print(f"INFO: [ClientFactory] Created Gemini Express client for project {project_id} (key index: {original_idx})")
+                    return client
+                else:
+                    client = genai.Client(vertexai=True, api_key=key_val)
+                    print(f"INFO: [ClientFactory] Created Gemini Express client (key index: {original_idx})")
+                    return client
+            else:
+                # SA credential path
+                rotated_credentials, rotated_project_id = credential_manager_instance.get_credentials()  # Rotates credentials
+                if not rotated_credentials or not rotated_project_id:
+                    raise Exception("SA credentials not available for Gemini client.")
+                
+                client = genai.Client(vertexai=True, credentials=rotated_credentials, project=rotated_project_id, location="global")
+                print(f"INFO: [ClientFactory] Created Gemini SA client for project: {rotated_project_id}")
+                return client
 
-        # If we reach here and client_to_use is still None, it means it's an OpenAI Direct Model,
-        # which handles its own client and responses.
-        # For Gemini models (Express or SA), client_to_use must be set, or an error returned above.
-        if not is_openai_direct_model and client_to_use is None:
-             # This case should ideally not be reached if the logic above is correct,
-             # as each path (Express/SA for Gemini) should either set client_to_use or return an error.
-             # This is a safeguard.
-            print(f"CRITICAL ERROR: Client for Gemini model '{request.model}' was not initialized, and no specific error was returned. This indicates a logic flaw.")
-            return JSONResponse(status_code=500, content=create_openai_error_response(500, "Critical internal server error: Gemini client not initialized.", "server_error"))
+        # Validate that we have credentials/keys available before proceeding
+        if not is_openai_direct_model:
+            if is_express_model_request:
+                if express_key_manager_instance.get_total_keys() == 0:
+                    error_msg = f"Model '{request.model}' is an Express model and requires an Express API key, but none are configured."
+                    print(f"ERROR: {error_msg}")
+                    return JSONResponse(status_code=401, content=create_openai_error_response(401, error_msg, "authentication_error"))
+                print(f"INFO: Gemini Express Mode enabled for model: {request.model} (base: {base_model_name})")
+            else:
+                # Verify SA credentials exist
+                test_creds, test_proj = credential_manager_instance.get_credentials()
+                if not test_creds or not test_proj:
+                    error_msg = f"Model '{request.model}' requires SA credentials for Gemini, but none are available or loaded."
+                    print(f"ERROR: {error_msg}")
+                    return JSONResponse(status_code=401, content=create_openai_error_response(401, error_msg, "authentication_error"))
+                print(f"INFO: Gemini SA Mode enabled for model: {request.model}")
 
         if is_openai_direct_model:
             # Use the new OpenAI handler
@@ -208,7 +186,9 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
                 current_gen_config_dict = attempt["config_modifier"](gen_config_dict.copy())
                 try:
                     # Pass is_auto_attempt=True for auto-mode calls
-                    result = await execute_gemini_call(client_to_use, attempt["model"], attempt["prompt_func"], current_gen_config_dict, request, is_auto_attempt=True)
+                    # For auto mode, create one client and use it (not a factory)
+                    auto_client = await gemini_client_factory()
+                    result = await execute_gemini_call(auto_client, attempt["model"], attempt["prompt_func"], current_gen_config_dict, request, is_auto_attempt=True)
                     return result
                 except Exception as e_auto:
                     last_err = e_auto
@@ -269,7 +249,7 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
                 if budget == 0:
                     gen_config_dict["thinking_config"]["include_thoughts"] = False
 
-            return await execute_gemini_call(client_to_use, base_model_name, current_prompt_func, gen_config_dict, request)
+            return await execute_gemini_call(gemini_client_factory, base_model_name, current_prompt_func, gen_config_dict, request)
 
     except Exception as e:
         error_msg = f"Unexpected error in chat_completions endpoint: {str(e)}"

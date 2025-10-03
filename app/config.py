@@ -43,3 +43,7 @@ SAFETY_SCORE = os.environ.get("SAFETY_SCORE", "false").lower() == "true"
 # Proxy settings
 PROXY_URL = os.environ.get("PROXY_URL")
 SSL_CERT_FILE = os.environ.get("SSL_CERT_FILE")
+
+# Race mode settings - concurrent requests for better reliability
+RACE_MODE_ENABLED = os.environ.get("RACE_MODE", "false").lower() == "true"
+RACE_CONCURRENT_COUNT = int(os.environ.get("RACE_CONCURRENT_COUNT", "3"))  # Number of concurrent requests

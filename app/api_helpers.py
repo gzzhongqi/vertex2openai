@@ -20,6 +20,58 @@ from message_processing import (
 import config as app_config
 from config import VERTEX_REASONING_TAG
 
+
+async def race_async_calls(call_func: Callable, num_concurrent: int = 3):
+    """
+    Race multiple identical async calls and return the first successful result.
+    Cancel all other tasks once the first one succeeds.
+    
+    Args:
+        call_func: An async callable that returns a result
+        num_concurrent: Number of concurrent calls to make
+    
+    Returns:
+        The result from the first successful call
+    
+    Raises:
+        Exception: If all concurrent calls fail, raises the last exception
+    """
+    tasks = [asyncio.create_task(call_func()) for _ in range(num_concurrent)]
+    
+    try:
+        while tasks:
+            # Wait for the first task to complete
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            
+            for task in done:
+                try:
+                    result = task.result()
+                    # First successful result - cancel all pending tasks
+                    print(f"INFO: Race mode - Got successful result, cancelling {len(pending)} pending tasks")
+                    for pending_task in pending:
+                        pending_task.cancel()
+                    # Wait a bit for cancellations to process
+                    if pending:
+                        await asyncio.wait(pending, timeout=0.1)
+                    return result
+                except Exception as e:
+                    # This task failed, try the next one
+                    print(f"WARNING: Race mode - One task failed: {type(e).__name__}: {str(e)[:100]}")
+                    tasks.remove(task)
+                    continue
+            
+            # Update tasks list to only include pending ones
+            tasks = list(pending)
+        
+        # All tasks failed
+        raise Exception("All concurrent race attempts failed")
+    
+    except asyncio.CancelledError:
+        # If this race itself is cancelled, cancel all tasks
+        for task in tasks:
+            task.cancel()
+        raise
+
 class StreamingReasoningProcessor:
     def __init__(self, tag_name: str = VERTEX_REASONING_TAG):
         self.tag_name = tag_name
@@ -275,18 +327,25 @@ async def gemini_fake_stream_generator(
     prompt_for_api_call: List[types.Content],
     gen_config_dict_for_api_call: Dict[str, Any], 
     request_obj: OpenAIRequest,
-    is_auto_attempt: bool
+    is_auto_attempt: bool,
+    race_count: int = 1
 ):
     model_name_for_log = getattr(gemini_client_instance, 'model_name', 'unknown_gemini_model_object')
-    print(f"FAKE STREAMING (Gemini): Prep for '{request_obj.model}' (API model string: '{model_for_api_call}', client obj: '{model_name_for_log}')")
+    print(f"FAKE STREAMING (Gemini): Prep for '{request_obj.model}' (API model string: '{model_for_api_call}', client obj: '{model_name_for_log}', race_count: {race_count})")
     
-    api_call_task = asyncio.create_task(
-        gemini_client_instance.aio.models.generate_content(
+    # Create the API call function for racing
+    async def _make_api_call():
+        return await gemini_client_instance.aio.models.generate_content(
             model=model_for_api_call, 
             contents=prompt_for_api_call, 
             config=gen_config_dict_for_api_call # Pass the dictionary directly
         )
-    )
+    
+    # Use race mode if race_count > 1
+    if race_count > 1:
+        api_call_task = asyncio.create_task(race_async_calls(_make_api_call, race_count))
+    else:
+        api_call_task = asyncio.create_task(_make_api_call())
 
     outer_keep_alive_interval = app_config.FAKE_STREAMING_INTERVAL_SECONDS
     if outer_keep_alive_interval > 0:
@@ -331,10 +390,11 @@ async def openai_fake_stream_generator(
     openai_params: Dict[str, Any],
     openai_extra_body: Dict[str, Any],
     request_obj: OpenAIRequest,
-    is_auto_attempt: bool
+    is_auto_attempt: bool,
+    race_count: int = 1
 ):
     api_model_name = openai_params.get("model", "unknown-openai-model")
-    print(f"FAKE STREAMING (OpenAI Direct): Prep for '{request_obj.model}' (API model: '{api_model_name}')")
+    print(f"FAKE STREAMING (OpenAI Direct): Prep for '{request_obj.model}' (API model: '{api_model_name}', race_count: {race_count})")
     response_id = f"chatcmpl-openaidirectfake-{int(time.time())}"
     
     async def _openai_api_call_task():
@@ -342,7 +402,11 @@ async def openai_fake_stream_generator(
         params_for_call['stream'] = False 
         return await openai_client.chat.completions.create(**params_for_call, extra_body=openai_extra_body)
 
-    api_call_task = asyncio.create_task(_openai_api_call_task())
+    # Use race mode if race_count > 1
+    if race_count > 1:
+        api_call_task = asyncio.create_task(race_async_calls(_openai_api_call_task, race_count))
+    else:
+        api_call_task = asyncio.create_task(_openai_api_call_task())
     outer_keep_alive_interval = app_config.FAKE_STREAMING_INTERVAL_SECONDS
     if outer_keep_alive_interval > 0:
         while not api_call_task.done():
@@ -411,16 +475,28 @@ async def execute_gemini_call(
     client_model_name_for_log = getattr(current_client, 'model_name', 'unknown_direct_client_object')
     print(f"INFO: execute_gemini_call for requested API model '{model_to_call}', using client object with internal name '{client_model_name_for_log}'. Original request model: '{request_obj.model}'")
     
+    # Race mode enabled - use concurrent requests for better reliability
+    race_enabled = app_config.RACE_MODE_ENABLED and not is_auto_attempt
+    race_count = app_config.RACE_CONCURRENT_COUNT if race_enabled else 1
+    
+    if race_enabled:
+        print(f"INFO: Race mode ENABLED - will make {race_count} concurrent requests and use first successful one")
+    
     if request_obj.stream:
-        if app_config.FAKE_STREAMING_ENABLED:
+        # For streaming, if race mode is enabled, force fake streaming to enable racing
+        use_fake_streaming = app_config.FAKE_STREAMING_ENABLED or race_enabled
+        
+        if use_fake_streaming:
+            if race_enabled:
+                print(f"INFO: Race mode - forcing fake streaming for race support")
             return StreamingResponse(
                 gemini_fake_stream_generator(
                     current_client, model_to_call, actual_prompt_for_call,
                     gen_config_dict, 
-                    request_obj, is_auto_attempt
+                    request_obj, is_auto_attempt, race_count
                 ), media_type="text/event-stream"
             )
-        else: # True Streaming
+        else: # True Streaming (no race mode)
             response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}"
             async def _gemini_real_stream_generator_inner():
                 try:
@@ -444,40 +520,49 @@ async def execute_gemini_call(
                     raise e_stream_call
             return StreamingResponse(_gemini_real_stream_generator_inner(), media_type="text/event-stream")
     else: # Non-streaming
-        response_obj_call = await current_client.aio.models.generate_content(
-            model=model_to_call, 
-            contents=actual_prompt_for_call,
-            config=gen_config_dict # Pass the dictionary directly
-        )
-        if hasattr(response_obj_call, 'prompt_feedback') and \
-           hasattr(response_obj_call.prompt_feedback, 'block_reason') and \
-           response_obj_call.prompt_feedback.block_reason:
-            block_msg = f"Blocked (Gemini): {response_obj_call.prompt_feedback.block_reason}"
-            if hasattr(response_obj_call.prompt_feedback,'block_reason_message') and \
-               response_obj_call.prompt_feedback.block_reason_message: 
-                block_msg+=f" ({response_obj_call.prompt_feedback.block_reason_message})"
-            raise ValueError(block_msg)
+        async def _single_gemini_call():
+            response_obj_call = await current_client.aio.models.generate_content(
+                model=model_to_call, 
+                contents=actual_prompt_for_call,
+                config=gen_config_dict # Pass the dictionary directly
+            )
+            if hasattr(response_obj_call, 'prompt_feedback') and \
+               hasattr(response_obj_call.prompt_feedback, 'block_reason') and \
+               response_obj_call.prompt_feedback.block_reason:
+                block_msg = f"Blocked (Gemini): {response_obj_call.prompt_feedback.block_reason}"
+                if hasattr(response_obj_call.prompt_feedback,'block_reason_message') and \
+                   response_obj_call.prompt_feedback.block_reason_message: 
+                    block_msg+=f" ({response_obj_call.prompt_feedback.block_reason_message})"
+                raise ValueError(block_msg)
+            
+            if not is_gemini_response_valid(response_obj_call):
+                error_details = f"Invalid non-streaming Gemini response for model string '{model_to_call}'. "
+                if hasattr(response_obj_call, 'candidates'):
+                    error_details += f"Candidates: {len(response_obj_call.candidates) if response_obj_call.candidates else 0}. "
+                    if response_obj_call.candidates and len(response_obj_call.candidates) > 0:
+                        candidate = response_obj_call.candidates if isinstance(response_obj_call.candidates, list) else response_obj_call.candidates
+                        if hasattr(candidate, 'content'):
+                            error_details += "Has content. "
+                            if hasattr(candidate.content, 'parts'):
+                                error_details += f"Parts: {len(candidate.content.parts) if candidate.content.parts else 0}. "
+                                if candidate.content.parts and len(candidate.content.parts) > 0:
+                                    part = candidate.content.parts if isinstance(candidate.content.parts, list) else candidate.content.parts
+                                    if hasattr(part, 'text'):
+                                        text_preview = str(getattr(part, 'text', ''))[:100]
+                                        error_details += f"First part text: '{text_preview}'"
+                                    elif hasattr(part, 'function_call'):
+                                        error_details += f"First part is function_call: {part.function_call.name}"
+                else:
+                    error_details += f"Response type: {type(response_obj_call).__name__}"
+                raise ValueError(error_details)
+            
+            return response_obj_call
         
-        if not is_gemini_response_valid(response_obj_call):
-            error_details = f"Invalid non-streaming Gemini response for model string '{model_to_call}'. "
-            if hasattr(response_obj_call, 'candidates'):
-                error_details += f"Candidates: {len(response_obj_call.candidates) if response_obj_call.candidates else 0}. "
-                if response_obj_call.candidates and len(response_obj_call.candidates) > 0:
-                    candidate = response_obj_call.candidates if isinstance(response_obj_call.candidates, list) else response_obj_call.candidates
-                    if hasattr(candidate, 'content'):
-                        error_details += "Has content. "
-                        if hasattr(candidate.content, 'parts'):
-                            error_details += f"Parts: {len(candidate.content.parts) if candidate.content.parts else 0}. "
-                            if candidate.content.parts and len(candidate.content.parts) > 0:
-                                part = candidate.content.parts if isinstance(candidate.content.parts, list) else candidate.content.parts
-                                if hasattr(part, 'text'):
-                                    text_preview = str(getattr(part, 'text', ''))[:100]
-                                    error_details += f"First part text: '{text_preview}'"
-                                elif hasattr(part, 'function_call'):
-                                    error_details += f"First part is function_call: {part.function_call.name}"
-            else:
-                error_details += f"Response type: {type(response_obj_call).__name__}"
-            raise ValueError(error_details)
+        # Use race mode for non-streaming if enabled
+        if race_enabled:
+            response_obj_call = await race_async_calls(_single_gemini_call, race_count)
+        else:
+            response_obj_call = await _single_gemini_call()
         
         openai_response_content = convert_to_openai_format(response_obj_call, request_obj.model)
         return JSONResponse(content=openai_response_content)

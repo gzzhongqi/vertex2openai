@@ -220,40 +220,51 @@ class OpenAIDirectHandler:
     
     async def handle_streaming_response(
         self,
-        openai_client: Any, # Can be openai.AsyncOpenAI or our wrapper
+        client_factory,  # Factory function to create new clients for each race attempt
         openai_params: Dict[str, Any],
         openai_extra_body: Dict[str, Any],
-        request: OpenAIRequest
+        request: OpenAIRequest,
+        race_count: int = 1
     ) -> StreamingResponse:
         """Handle streaming responses for OpenAI Direct mode."""
-        if app_config.FAKE_STREAMING_ENABLED:
-            print(f"INFO: OpenAI Fake Streaming (SSE Simulation) ENABLED for model '{request.model}'.")
+        # Force fake streaming if race mode is enabled (to support racing)
+        use_fake_streaming = app_config.FAKE_STREAMING_ENABLED or race_count > 1
+        
+        if use_fake_streaming:
+            if race_count > 1:
+                print(f"INFO: OpenAI Fake Streaming ENABLED for race mode (count: {race_count}) for model '{request.model}'. Each request will use a different rotated key.")
+            else:
+                print(f"INFO: OpenAI Fake Streaming (SSE Simulation) ENABLED for model '{request.model}'.")
             return StreamingResponse(
                 openai_fake_stream_generator(
-                    openai_client=openai_client,
+                    client_factory=client_factory,
                     openai_params=openai_params,
                     openai_extra_body=openai_extra_body,
                     request_obj=request,
-                    is_auto_attempt=False
+                    is_auto_attempt=False,
+                    race_count=race_count
                 ),
                 media_type="text/event-stream"
             )
         else:
             print(f"INFO: OpenAI True Streaming ENABLED for model '{request.model}'.")
             return StreamingResponse(
-                self._true_stream_generator(openai_client, openai_params, openai_extra_body, request),
+                self._true_stream_generator(client_factory, openai_params, openai_extra_body, request),
                 media_type="text/event-stream"
             )
     
     async def _true_stream_generator(
         self,
-        openai_client: Any, # Can be openai.AsyncOpenAI or our wrapper
+        client_factory,  # Factory function to create client
         openai_params: Dict[str, Any],
         openai_extra_body: Dict[str, Any],
         request: OpenAIRequest
     ) -> AsyncGenerator[str, None]:
         """Generate true streaming response."""
         try:
+            # Get a client from the factory (with rotated key)
+            openai_client = await client_factory()
+            
             # Ensure stream=True is explicitly passed for real streaming
             openai_params_for_stream = {**openai_params, "stream": True}
             stream_response = await openai_client.chat.completions.create(
@@ -392,19 +403,34 @@ class OpenAIDirectHandler:
     
     async def handle_non_streaming_response(
         self,
-        openai_client: Any, # Can be openai.AsyncOpenAI or our wrapper
+        client_factory,  # Factory function to create new clients for each race attempt
         openai_params: Dict[str, Any],
         openai_extra_body: Dict[str, Any],
-        request: OpenAIRequest
+        request: OpenAIRequest,
+        race_count: int = 1
     ) -> JSONResponse:
         """Handle non-streaming responses for OpenAI Direct mode."""
         try:
             # Ensure stream=False is explicitly passed
             openai_params_non_stream = {**openai_params, "stream": False}
-            response = await openai_client.chat.completions.create(
-                **openai_params_non_stream,
-                extra_body=openai_extra_body
-            )
+            
+            # Create API call function for potential racing
+            # Each call gets a NEW client with rotated key
+            async def _make_openai_call():
+                openai_client = await client_factory()  # Get new client with rotated key
+                return await openai_client.chat.completions.create(
+                    **openai_params_non_stream,
+                    extra_body=openai_extra_body
+                )
+            
+            # Use race mode if race_count > 1
+            if race_count > 1:
+                from api_helpers import race_async_calls
+                print(f"INFO: OpenAI Direct - Using race mode with {race_count} concurrent requests, each with a different rotated key")
+                response = await race_async_calls(_make_openai_call, race_count)
+            else:
+                response = await _make_openai_call()
+            
             response_dict = response.model_dump(exclude_unset=True, exclude_none=True)
             
             try:
@@ -450,48 +476,55 @@ class OpenAIDirectHandler:
         """Main entry point for processing OpenAI Direct mode requests."""
         print(f"INFO: Using OpenAI Direct Path for model: {request.model} (Express: {is_express})")
         
-        client: Any = None # Can be openai.AsyncOpenAI or our wrapper
+        # Check if race mode is enabled
+        import config as app_config
+        race_count = app_config.RACE_CONCURRENT_COUNT if app_config.RACE_MODE_ENABLED else 1
+        if race_count > 1:
+            print(f"INFO: OpenAI Direct - Race mode ENABLED with {race_count} concurrent requests, each will use a different rotated key")
 
-        try:
+        # Create a factory function that returns a new client each time (with key rotation)
+        async def client_factory():
+            """Factory that creates a new client with rotated key/credential on each call."""
             if is_express:
                 if not self.express_key_manager:
                     raise Exception("Express mode requires an ExpressKeyManager, but it was not provided.")
                 
-                key_tuple = self.express_key_manager.get_express_api_key()
+                key_tuple = self.express_key_manager.get_express_api_key()  # This rotates keys
                 if not key_tuple:
                     raise Exception("OpenAI Express Mode requires an API key, but none were available.")
                 
                 _, express_api_key = key_tuple
                 project_id = await discover_project_id(express_api_key)
                 
-                client = ExpressClientWrapper(project_id=project_id, api_key=express_api_key)
-                print(f"INFO: [OpenAI Express Path] Using ExpressClientWrapper for project: {project_id}")
+                print(f"INFO: [ClientFactory] Created ExpressClientWrapper for project: {project_id}")
+                return ExpressClientWrapper(project_id=project_id, api_key=express_api_key)
 
             else: # Standard SA-based OpenAI SDK Path
                 if not self.credential_manager:
                     raise Exception("Standard OpenAI Direct mode requires a CredentialManager.")
 
-                rotated_credentials, rotated_project_id = self.credential_manager.get_credentials()
+                rotated_credentials, rotated_project_id = self.credential_manager.get_credentials()  # This rotates credentials
                 if not rotated_credentials or not rotated_project_id:
                     raise Exception("OpenAI Direct Mode requires GCP credentials, but none were available.")
 
-                print(f"INFO: [OpenAI Direct Path] Using credentials for project: {rotated_project_id}")
+                print(f"INFO: [ClientFactory] Created OpenAI client for project: {rotated_project_id}")
                 gcp_token = _refresh_auth(rotated_credentials)
                 if not gcp_token:
                     raise Exception(f"Failed to obtain valid GCP token for OpenAI client (Project: {rotated_project_id}).")
-                client = self.create_openai_client(rotated_project_id, gcp_token)
+                return self.create_openai_client(rotated_project_id, gcp_token)
 
+        try:
             model_id = f"google/{base_model_name}"
             openai_params = self.prepare_openai_params(request, model_id, is_openai_search)
             openai_extra_body = self.prepare_extra_body()
             
             if request.stream:
                 return await self.handle_streaming_response(
-                    client, openai_params, openai_extra_body, request
+                    client_factory, openai_params, openai_extra_body, request, race_count
                 )
             else:
                 return await self.handle_non_streaming_response(
-                    client, openai_params, openai_extra_body, request
+                    client_factory, openai_params, openai_extra_body, request, race_count
                 )
         except Exception as e:
             error_msg = f"Error in process_request for {request.model}: {e}"
