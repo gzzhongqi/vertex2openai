@@ -3,7 +3,6 @@ import time
 import math
 import asyncio
 from typing import List, Dict, Any, Callable, Union, Optional, Awaitable, AsyncGenerator
-from async_generator import anext
 
 from fastapi.responses import JSONResponse, StreamingResponse
 from google.auth.transport.requests import Request as AuthRequest
