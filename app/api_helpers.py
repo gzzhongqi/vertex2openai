@@ -2,7 +2,8 @@ import json
 import time
 import math
 import asyncio
-from typing import List, Dict, Any, Callable, Union, Optional, Awaitable
+from typing import List, Dict, Any, Callable, Union, Optional, Awaitable, AsyncGenerator
+from async_generator import anext
 
 from fastapi.responses import JSONResponse, StreamingResponse
 from google.auth.transport.requests import Request as AuthRequest
@@ -71,6 +72,125 @@ async def race_async_calls(call_func: Callable, num_concurrent: int = 3):
         for task in tasks:
             task.cancel()
         raise
+
+async def race_for_longest_string(call_func: Callable, num_concurrent: int = 3):
+    """
+    Race multiple identical async calls, wait for all to complete, 
+    and return the result with the longest content string.
+    
+    Args:
+        call_func: An async callable that returns a result object.
+        num_concurrent: Number of concurrent calls to make.
+    
+    Returns:
+        The result from the call that produced the longest content.
+        
+    Raises:
+        Exception: If all concurrent calls fail.
+    """
+    tasks = [asyncio.create_task(call_func()) for _ in range(num_concurrent)]
+    
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    successful_results = []
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            print(f"WARNING: Race-for-longest - Task {i} failed: {type(result).__name__}: {str(result)[:100]}")
+        else:
+            successful_results.append(result)
+            
+    if not successful_results:
+        raise Exception("All concurrent race-for-longest attempts failed.")
+
+    longest_result = None
+    max_len = -1
+
+    for result in successful_results:
+        content_len = 0
+        try:
+            # Heuristic to find content length for both Gemini and OpenAI Direct objects
+            if hasattr(result, 'candidates') and result.candidates: # Gemini response
+                content = result.candidates[0].content.parts[0].text
+                content_len = len(content)
+            elif hasattr(result, 'choices') and result.choices: # OpenAI-like response
+                content = result.choices[0].message.content
+                content_len = len(content) if content else 0
+        except (AttributeError, IndexError) as e:
+            print(f"WARNING: Could not determine content length for a result. Error: {e}")
+            content_len = 0
+            
+        if content_len > max_len:
+            max_len = content_len
+            longest_result = result
+            
+    print(f"INFO: Race-for-longest - Chose result with content length: {max_len}")
+    return longest_result
+
+async def race_streaming_generators(generator_factories: List[Callable[[], AsyncGenerator]]):
+    """
+    Races multiple async generators and yields from the one that produces the first item the fastest.
+    
+    Args:
+        generator_factories: A list of no-argument functions that each return an async generator.
+    """
+    queue = asyncio.Queue()
+    tasks = []
+    
+    async def _runner(factory: Callable[[], AsyncGenerator], task_id: int):
+        """Wraps a generator to put its first item into a queue."""
+        try:
+            generator = factory()
+            first_item = await anext(generator)
+            await queue.put((task_id, first_item, generator))
+        except (StopAsyncIteration, Exception) as e:
+            await queue.put((task_id, e, None))
+
+    try:
+        # Start all runners
+        for i, factory in enumerate(generator_factories):
+            task = asyncio.create_task(_runner(factory, i))
+            tasks.append(task)
+            
+        # Wait for the first one to put something in the queue
+        winner_id, first_item, winner_generator = await queue.get()
+        
+        # If the first result is an exception, we need to wait for another
+        while isinstance(first_item, Exception):
+            print(f"WARNING: Race-streaming - Task {winner_id} failed before yielding first chunk: {first_item}")
+            tasks.pop(winner_id) # Should be careful with index
+            if not tasks:
+                raise Exception("All streaming race attempts failed before yielding any data.") from first_item
+            
+            # Reset task list to avoid index issues
+            active_tasks = [t for t in tasks if not t.done()]
+            if not active_tasks:
+                 raise Exception("All streaming race attempts failed before yielding any data.")
+            tasks = active_tasks
+            
+            winner_id, first_item, winner_generator = await queue.get()
+
+        print(f"INFO: Race-streaming - Task {winner_id} was the fastest to yield data. Cancelling others.")
+        
+        # Cancel all other tasks
+        for i, task in enumerate(tasks):
+            if i != winner_id:
+                task.cancel()
+        
+        # Yield the first item from the winner
+        yield first_item
+        
+        # Yield the rest of the items from the winning generator
+        async for item in winner_generator:
+            yield item
+            
+    finally:
+        # Final cleanup of all tasks
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        # Drain the queue to prevent hanging
+        while not queue.empty():
+            queue.get_nowait()
 
 class StreamingReasoningProcessor:
     def __init__(self, tag_name: str = VERTEX_REASONING_TAG):
@@ -488,17 +608,38 @@ async def execute_gemini_call(
         print(f"INFO: Race mode ENABLED - will make {race_count} concurrent requests and use first successful one")
     
     if request_obj.stream:
-        # For streaming, race mode forces fake streaming to work
-        use_fake_streaming = app_config.FAKE_STREAMING_ENABLED or race_enabled
-        
-        if use_fake_streaming:
-            if race_enabled:
-                print(f"INFO: Race mode - forcing fake streaming for race support")
+        # For streaming, if race mode is enabled, we race the true streams
+        if race_enabled:
+            print("INFO: Race mode (streaming) - racing true streams to get the fastest first chunk.")
+            
+            async def create_generator_factory(client_factory_func):
+                # This closure captures the client factory for the generator
+                async def generator_factory():
+                    stream_client = await client_factory_func()
+                    stream_gen_obj = await stream_client.aio.models.generate_content_stream(
+                        model=model_to_call, 
+                        contents=actual_prompt_for_call,
+                        config=gen_config_dict
+                    )
+                    response_id_for_stream = f"chatcmpl-racestream-{int(time.time())}"
+                    async for chunk_item_call in stream_gen_obj:
+                        yield convert_chunk_to_openai(chunk_item_call, request_obj.model, response_id_for_stream, 0)
+                    yield "data: [DONE]\n\n"
+                return generator_factory
+
+            # Create a list of generator factories, one for each concurrent request
+            generator_factories = [await create_generator_factory(client_factory) for _ in range(race_count)]
+            
+            return StreamingResponse(race_streaming_generators(generator_factories), media_type="text/event-stream")
+
+        # Standard true streaming or fake streaming if enabled
+        if app_config.FAKE_STREAMING_ENABLED:
+            print("INFO: Fake streaming is enabled.")
             return StreamingResponse(
                 gemini_fake_stream_generator(
                     client_factory, model_to_call, actual_prompt_for_call,
                     gen_config_dict, 
-                    request_obj, is_auto_attempt, race_count
+                    request_obj, is_auto_attempt, 1 # race_count is 1 here
                 ), media_type="text/event-stream"
             )
         else: # True Streaming (no race mode)
@@ -552,7 +693,8 @@ async def execute_gemini_call(
         
         # Use race mode for non-streaming if enabled
         if race_enabled:
-            response_obj_call = await race_async_calls(_single_gemini_call, race_count)
+            print("INFO: Race mode (non-streaming) - waiting for all requests to complete to select the longest response.")
+            response_obj_call = await race_for_longest_string(_single_gemini_call, race_count)
         else:
             response_obj_call = await _single_gemini_call()
         

@@ -8,3 +8,4 @@ httpx[socks]>=0.25.0
 openai
 google-auth-oauthlib
 aiohttp
+async_generator

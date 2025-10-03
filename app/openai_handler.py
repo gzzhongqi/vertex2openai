@@ -227,14 +227,26 @@ class OpenAIDirectHandler:
         race_count: int = 1
     ) -> StreamingResponse:
         """Handle streaming responses for OpenAI Direct mode."""
-        # Force fake streaming if race mode is enabled (to support racing)
-        use_fake_streaming = app_config.FAKE_STREAMING_ENABLED or race_count > 1
         
-        if use_fake_streaming:
-            if race_count > 1:
-                print(f"INFO: OpenAI Fake Streaming ENABLED for race mode (count: {race_count}) for model '{request.model}'. Each request will use a different rotated key.")
-            else:
-                print(f"INFO: OpenAI Fake Streaming (SSE Simulation) ENABLED for model '{request.model}'.")
+        # If race mode is enabled, race the true streams
+        if race_count > 1:
+            print(f"INFO: OpenAI Direct (streaming) - racing {race_count} true streams to get fastest first chunk.")
+            
+            async def create_generator_factory(client_factory_func):
+                async def generator_factory():
+                    # This internal generator will be raced
+                    async for chunk in self._true_stream_generator(client_factory_func, openai_params, openai_extra_body, request):
+                        yield chunk
+                return generator_factory
+
+            generator_factories = [await create_generator_factory(client_factory) for _ in range(race_count)]
+            
+            from api_helpers import race_streaming_generators
+            return StreamingResponse(race_streaming_generators(generator_factories), media_type="text/event-stream")
+
+        # Standard streaming (fake or true) when not racing
+        if app_config.FAKE_STREAMING_ENABLED:
+            print(f"INFO: OpenAI Fake Streaming (SSE Simulation) ENABLED for model '{request.model}'.")
             return StreamingResponse(
                 openai_fake_stream_generator(
                     client_factory=client_factory,
@@ -242,7 +254,7 @@ class OpenAIDirectHandler:
                     openai_extra_body=openai_extra_body,
                     request_obj=request,
                     is_auto_attempt=False,
-                    race_count=race_count
+                    race_count=1 # Not racing here
                 ),
                 media_type="text/event-stream"
             )
@@ -425,9 +437,9 @@ class OpenAIDirectHandler:
             
             # Use race mode if race_count > 1
             if race_count > 1:
-                from api_helpers import race_async_calls
-                print(f"INFO: OpenAI Direct - Using race mode with {race_count} concurrent requests, each with a different rotated key")
-                response = await race_async_calls(_make_openai_call, race_count)
+                from api_helpers import race_for_longest_string
+                print(f"INFO: OpenAI Direct (non-streaming) - Using race-for-longest mode with {race_count} concurrent requests.")
+                response = await race_for_longest_string(_make_openai_call, race_count)
             else:
                 response = await _make_openai_call()
             
