@@ -142,7 +142,7 @@ class OpenAIDirectHandler:
     def __init__(self, credential_manager=None, express_key_manager=None):
         self.credential_manager = credential_manager
         self.express_key_manager = express_key_manager
-        safety_threshold = "BLOCK_NONE" if app_config.SAFETY_SCORE else "OFF"
+        safety_threshold = "BLOCK_NONE"
         self.safety_settings = [
             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": safety_threshold},
             {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": safety_threshold},
@@ -153,7 +153,8 @@ class OpenAIDirectHandler:
             {"category": "HARM_CATEGORY_IMAGE_HATE", "threshold": safety_threshold},
             {"category": "HARM_CATEGORY_IMAGE_DANGEROUS_CONTENT", "threshold": safety_threshold},
             {"category": "HARM_CATEGORY_IMAGE_HARASSMENT", "threshold": safety_threshold},
-            {"category": 'HARM_CATEGORY_IMAGE_SEXUALLY_EXPLICIT', "threshold": safety_threshold}
+            {"category": 'HARM_CATEGORY_IMAGE_SEXUALLY_EXPLICIT', "threshold": safety_threshold},
+            {"category": 'HARM_CATEGORY_JAILBREAK', "threshold": safety_threshold}
         ]
 
     def create_openai_client(self, project_id: str, gcp_token: str, location: str = "global") -> openai.AsyncOpenAI:

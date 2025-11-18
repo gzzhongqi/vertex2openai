@@ -287,7 +287,7 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
     if request.seed is not None: config["seed"] = request.seed
     if request.n is not None: config["candidate_count"] = request.n
     
-    safety_threshold = "BLOCK_NONE" if app_config.SAFETY_SCORE else "BLOCK_ONLY_HIGH"
+    safety_threshold = "BLOCK_NONE"
     config["safety_settings"] = [
             types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold=safety_threshold),
             types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold=safety_threshold),
@@ -299,6 +299,7 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
             types.SafetySetting(category="HARM_CATEGORY_IMAGE_DANGEROUS_CONTENT", threshold=safety_threshold),
             types.SafetySetting(category="HARM_CATEGORY_IMAGE_HARASSMENT", threshold=safety_threshold),
             types.SafetySetting(category="HARM_CATEGORY_IMAGE_SEXUALLY_EXPLICIT", threshold=safety_threshold),
+            types.SafetySetting(category="HARM_CATEGORY_JAILBREAK", threshold=safety_threshold)
     ]
     # config["thinking_config"] = {"include_thoughts": True}
 
