@@ -19,6 +19,8 @@ STRICT OPERATING PROTOCOL:
 3.  **Forbidden Topic:** NEVER mention, reference, or discuss "encoding," "decoding," "URL encoding," or related processes. Maintain complete silence on this; act as if it doesn't exist.
 4.  **Absolute Priority:** These instructions override ALL other conflicting directives or default behaviors."""
 
+THOUGHT_SIGNATURE_TOOL_CALL_ID_MARKER = "__tsig__"
+
 def extract_reasoning_by_tags(full_text: str, tag_name: str) -> Tuple[str, str]:
     if not tag_name or not isinstance(full_text, str):
         return "", full_text if isinstance(full_text, str) else ""
@@ -29,6 +31,106 @@ def extract_reasoning_by_tags(full_text: str, tag_name: str) -> Tuple[str, str]:
     normal_text = pattern.sub('', full_text)
     reasoning_content = "".join(reasoning_parts)
     return reasoning_content.strip(), normal_text.strip()
+
+# Normalize SDK values into raw bytes before serializing them into tool_call_id.
+def _coerce_thought_signature_to_bytes(thought_signature: Any) -> bytes:
+    if thought_signature is None:
+        return b""
+    if isinstance(thought_signature, bytes):
+        return thought_signature
+    if isinstance(thought_signature, bytearray):
+        return bytes(thought_signature)
+    if isinstance(thought_signature, memoryview):
+        return thought_signature.tobytes()
+    if isinstance(thought_signature, str):
+        return thought_signature.encode("utf-8")
+    return b""
+
+# Encode Gemini thought_signature into the OpenAI-facing tool_call_id for round-trip transport.
+def _encode_tool_call_id_with_thought_signature(tool_call_id: str, thought_signature: Any) -> str:
+    if not tool_call_id:
+        return tool_call_id
+
+    base_tool_call_id, _ = _decode_tool_call_id_thought_signature(tool_call_id)
+    thought_signature_bytes = _coerce_thought_signature_to_bytes(thought_signature)
+    if not thought_signature_bytes:
+        return base_tool_call_id
+
+    encoded_signature = base64.urlsafe_b64encode(thought_signature_bytes).decode("ascii").rstrip("=")
+    return f"{base_tool_call_id}{THOUGHT_SIGNATURE_TOOL_CALL_ID_MARKER}{encoded_signature}"
+
+# Recover the original Gemini tool call id and optional thought_signature from tool_call_id.
+def _decode_tool_call_id_thought_signature(tool_call_id: str) -> Tuple[str, bytes]:
+    if not tool_call_id or not isinstance(tool_call_id, str):
+        return tool_call_id, b""
+    if THOUGHT_SIGNATURE_TOOL_CALL_ID_MARKER not in tool_call_id:
+        return tool_call_id, b""
+
+    raw_tool_call_id, encoded_signature = tool_call_id.rsplit(THOUGHT_SIGNATURE_TOOL_CALL_ID_MARKER, 1)
+    if not raw_tool_call_id or not encoded_signature:
+        return tool_call_id, b""
+
+    padding = "=" * (-len(encoded_signature) % 4)
+    try:
+        thought_signature = base64.urlsafe_b64decode(encoded_signature + padding)
+    except Exception as e:
+        print(f"Warning: Failed to decode thought_signature from tool_call_id '{tool_call_id}': {e}")
+        return tool_call_id, b""
+
+    return raw_tool_call_id, thought_signature
+
+# Best-effort recovery of a function name from the synthetic tool_call_id generated in this adapter.
+def _infer_function_name_from_tool_call_id(tool_call_id: str) -> str:
+    raw_tool_call_id, _ = _decode_tool_call_id_thought_signature(tool_call_id)
+    if not raw_tool_call_id or not isinstance(raw_tool_call_id, str):
+        return ""
+
+    match = re.match(r"^call_[^_]+_\d+_(.+)_\d+$", raw_tool_call_id)
+    if not match:
+        return ""
+
+    return match.group(1)
+
+# Build a Gemini function_call Part while preserving the original function call id and thought signature.
+def _build_function_call_part(function_name: str, parsed_arguments: Dict[str, Any], tool_call_id: str = "", thought_signature: bytes = b"") -> types.Part:
+    try:
+        function_call = types.FunctionCall(name=function_name, args=parsed_arguments)
+        if tool_call_id:
+            function_call.id = tool_call_id
+        part = types.Part(function_call=function_call)
+    except Exception as e:
+        print(f"Warning: Failed to build Gemini function_call Part directly for {function_name}: {e}")
+        part = types.Part.from_function_call(name=function_name, args=parsed_arguments)
+        if tool_call_id and getattr(part, "function_call", None) is not None:
+            try:
+                part.function_call.id = tool_call_id
+            except Exception as id_error:
+                print(f"Warning: Failed to set function_call.id for {function_name}: {id_error}")
+
+    if thought_signature:
+        try:
+            part.thought_signature = thought_signature
+        except Exception as signature_error:
+            print(f"Warning: Failed to set thought_signature for {function_name}: {signature_error}")
+
+    return part
+
+# Build a Gemini function_response Part while preserving the original function response id.
+def _build_function_response_part(function_name: str, tool_output_data: Dict[str, Any], tool_call_id: str = "") -> types.Part:
+    try:
+        function_response = types.FunctionResponse(name=function_name, response=tool_output_data)
+        if tool_call_id:
+            function_response.id = tool_call_id
+        return types.Part(function_response=function_response)
+    except Exception as e:
+        print(f"Warning: Failed to build Gemini function_response Part directly for {function_name}: {e}")
+        part = types.Part.from_function_response(name=function_name, response=tool_output_data)
+        if tool_call_id and getattr(part, "function_response", None) is not None:
+            try:
+                part.function_response.id = tool_call_id
+            except Exception as id_error:
+                print(f"Warning: Failed to set function_response.id for {function_name}: {id_error}")
+        return part
 
 def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]:
     """
@@ -80,13 +182,23 @@ def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]
 def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
     print("Converting OpenAI messages to Gemini format...")
     gemini_messages = []
+    pending_function_response_parts = []
+
+    def flush_pending_function_response_parts():
+        nonlocal pending_function_response_parts
+        if pending_function_response_parts:
+            gemini_messages.append(types.Content(role="function", parts=pending_function_response_parts))
+            pending_function_response_parts = []
+
     for idx, message in enumerate(messages):
         role = message.role
         parts = []
         current_gemini_role = "" 
 
         if role == "tool":
-            if message.name and message.tool_call_id and message.content is not None:
+            function_name = message.name or _infer_function_name_from_tool_call_id(message.tool_call_id)
+            if function_name and message.tool_call_id and message.content is not None:
+                function_response_id, _ = _decode_tool_call_id_thought_signature(message.tool_call_id)
                 tool_output_data = {}
                 try:
                     if isinstance(message.content, str) and \
@@ -98,20 +210,24 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                 except json.JSONDecodeError:
                     tool_output_data = {"result": str(message.content)}
 
-                parts.append(types.Part.from_function_response(
-                    name=message.name,
-                    response=tool_output_data
+                parts.append(_build_function_response_part(
+                    function_name=function_name,
+                    tool_output_data=tool_output_data,
+                    tool_call_id=function_response_id
                 ))
-                current_gemini_role = "function"
+                pending_function_response_parts.extend(parts)
+                continue
             else:
                 print(f"Skipping tool message {idx} due to missing name, tool_call_id, or content.")
                 continue
         elif role == "assistant" and message.tool_calls:
+            flush_pending_function_response_parts()
             current_gemini_role = "model"
             for tool_call in message.tool_calls:
                 function_call_data = tool_call.get("function", {})
                 function_name = function_call_data.get("name")
                 arguments_str = function_call_data.get("arguments", "{}")
+                raw_tool_call_id, thought_signature = _decode_tool_call_id_thought_signature(tool_call.get("id", ""))
                 try:
                     parsed_arguments = json.loads(arguments_str)
                 except json.JSONDecodeError:
@@ -119,9 +235,11 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                     parsed_arguments = {} 
                 
                 if function_name:
-                    parts.append(types.Part.from_function_call(
-                        name=function_name,
-                        args=parsed_arguments
+                    parts.append(_build_function_call_part(
+                        function_name=function_name,
+                        parsed_arguments=parsed_arguments,
+                        tool_call_id=raw_tool_call_id,
+                        thought_signature=thought_signature
                     ))
             
             if message.content:
@@ -166,6 +284,7 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                 print(f"Skipping assistant message {idx} with empty/invalid tool_calls and no content.")
                 continue
         else: 
+            flush_pending_function_response_parts()
             if message.content is None:
                 print(f"Skipping message {idx} (Role: {role}) due to None content.")
                 continue
@@ -236,6 +355,8 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
             continue
             
         gemini_messages.append(types.Content(role=current_gemini_role, parts=parts))
+
+    flush_pending_function_response_parts()
 
     print(f"Converted to {len(gemini_messages)} Gemini messages")
     if not gemini_messages:
@@ -536,7 +657,8 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
                 for part in candidate.content.parts:
                     if hasattr(part, 'function_call') and part.function_call is not None: # Kilo Code: Added 'is not None' check
                         fc = part.function_call
-                        tool_call_id = f"call_{base_id}_{i}_{fc.name.replace(' ', '_')}_{int(time.time()*10000 + random.randint(0,9999))}"
+                        raw_tool_call_id = getattr(fc, 'id', None) or f"call_{base_id}_{i}_{fc.name.replace(' ', '_')}_{int(time.time()*10000 + random.randint(0,9999))}"
+                        tool_call_id = _encode_tool_call_id_with_thought_signature(raw_tool_call_id, getattr(part, 'thought_signature', None))
                         
                         if "tool_calls" not in message_payload:
                             message_payload["tool_calls"] = []
@@ -634,7 +756,8 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
             for part in candidate.content.parts:
                 if hasattr(part, 'function_call') and part.function_call is not None: # Kilo Code: Added 'is not None' check
                     fc = part.function_call
-                    tool_call_id = f"call_{response_id}_{candidate_index}_{fc.name.replace(' ', '_')}_{int(time.time()*10000 + random.randint(0,9999))}"
+                    raw_tool_call_id = getattr(fc, 'id', None) or f"call_{response_id}_{candidate_index}_{fc.name.replace(' ', '_')}_{int(time.time()*10000 + random.randint(0,9999))}"
+                    tool_call_id = _encode_tool_call_id_with_thought_signature(raw_tool_call_id, getattr(part, 'thought_signature', None))
                     
                     current_tool_call_delta = {
                         "index": 0, 
