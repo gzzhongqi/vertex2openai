@@ -151,8 +151,7 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
     if request.tools:
         for tool in request.tools:
             if tool.get("type") == "function":
-                # func_def = tool.get("function")
-                func_def = tool
+                func_def = tool.get("function")
                 if func_def:
                     # Extract only the fields accepted by the Gemini API
                     declaration = {
